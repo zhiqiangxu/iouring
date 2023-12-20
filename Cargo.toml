@@ -1,0 +1,17 @@
+[package]
+name = "iouring"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+io-uring = "0.6"
+crossbeam = "0.8.2"
+anyhow = "1"
+rustix = {version = "0.38", features = ["fs", "mm", "io_uring"]}
+
+
+[dev-dependencies]
+tempfile = "3.8.1"
+rand = "0.8"
