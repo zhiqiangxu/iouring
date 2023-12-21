@@ -11,7 +11,7 @@ use std::os::fd::RawFd;
 use std::ptr::from_exposed_addr;
 use std::ptr::from_exposed_addr_mut;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -35,16 +35,13 @@ use send_ptr::ToSendPtr;
 #[derive(Debug)]
 pub struct Manager {
     terminate: Arc<AtomicBool>,
-    uringloop_handle: JoinHandle<()>,
+    uringloop_handle: Option<JoinHandle<()>>,
     io_q: Arc<Queue<SendPtr<IO>>>,
 }
 
-#[derive(PartialEq)]
-pub enum OpResult {
-    Pending,
-    OK,
-    NG,
-}
+pub const OP_RESULT_PENDING: u8 = 0u8;
+pub const OP_RESULT_OK: u8 = 1u8;
+pub const OP_RESULT_NG: u8 = 2u8;
 
 impl Manager {
     pub fn new(fds: &[RawFd], queue_size: u32) -> Result<Self> {
@@ -57,7 +54,7 @@ impl Manager {
             .register_files(fds)
             .context("register files to io_uring")?;
 
-        let uringloop_handle = uringloop.start_loop();
+        let uringloop_handle = Some(uringloop.start_loop());
 
         Ok(Self {
             terminate,
@@ -66,12 +63,7 @@ impl Manager {
         })
     }
 
-    pub fn read(
-        &mut self,
-        buf: &mut [u8],
-        fd_idx: i32,
-        valid: SendPtr<AtomicPtr<OpResult>>,
-    ) -> SendPtr<IO> {
+    pub fn read(&self, buf: &mut [u8], fd_idx: i32, valid: &AtomicU8) -> SendPtr<IO> {
         unsafe {
             let io = self.io_q.alloc();
 
@@ -81,45 +73,48 @@ impl Manager {
             (*p_io).len = buf.len();
             (*p_io).op_code = OpCode::Read;
             (*p_io).leak = true;
-            (*p_io).manager = SendPtr::new(self as _);
-            (*p_io).user_arg = SendPtr::new(mem::transmute((valid.get().expose_addr(), 0)));
+            (*p_io).manager = SendPtr::new(self as *const Manager as *mut Manager);
+            (*p_io).user_arg = SendPtr::new(mem::transmute((
+                (valid as *const _ as *mut AtomicU8).expose_addr(),
+                0,
+            )));
             (*p_io).completion_cb = Self::read_completion_cb;
             io
         }
     }
 
-    pub fn terminate_and_wait(self) -> thread::Result<()> {
-        self.terminate.store(true, Ordering::Release);
-        self.uringloop_handle.join()
+    pub fn terminate_and_wait(&mut self) -> thread::Result<()> {
+        if let Some(uringloop_handle) = self.uringloop_handle.take() {
+            self.terminate.store(true, Ordering::Release);
+            uringloop_handle.join()
+        } else {
+            Ok(())
+        }
     }
 
-    pub fn push(&self, io: *mut IO) {
-        self.io_q.push_to_kernel(SendPtr::new(io));
+    pub fn push(&self, io: SendPtr<IO>) {
+        self.io_q.push_to_kernel(io);
     }
 
-    fn read_completion_cb(io: *mut IO) {
+    // returns a boolean value indicating whether IO is re-used.
+    fn read_completion_cb(io: *mut IO) -> bool {
         unsafe {
             let (valid, _): (usize, usize) = mem::transmute((*io).user_arg.get());
-            let valid: *const AtomicPtr<OpResult> = from_exposed_addr(valid);
+            let valid: *const AtomicU8 = from_exposed_addr(valid);
 
             if (*io).result <= 0 {
                 // dbg!(&*io);
-                let result = Box::into_raw(Box::new(OpResult::NG));
-                let raw_ptr = (*valid).swap(result, Ordering::Release);
-                if !raw_ptr.is_null() {
-                    drop(Box::from_raw(raw_ptr));
-                }
+                (*valid).swap(OP_RESULT_NG, Ordering::Release);
             } else if (*io).result as usize == (*io).len {
-                let result = Box::into_raw(Box::new(OpResult::OK));
-                let raw_ptr = (*valid).swap(result, Ordering::Release);
-                if !raw_ptr.is_null() {
-                    drop(Box::from_raw(raw_ptr));
-                }
+                (*valid).swap(OP_RESULT_OK, Ordering::Release);
             } else {
                 (*io).buf = SendPtr::new((*io).buf.get().offset((*io).result as isize));
                 (*io).len -= (*io).result as usize;
-                (*(*io).manager.get()).push(io);
+                (*io).offset += (*io).result as usize;
+                (*(*io).manager.get()).push(SendPtr::new(io));
+                return true;
             }
+            return false;
         }
     }
 }
@@ -136,13 +131,13 @@ pub struct IO {
     pub(crate) op_code: OpCode,
     pub(crate) fd: i32,
     pub(crate) len: usize,
-    pub(crate) offset: usize,
+    pub offset: usize,
     pub(crate) leak: bool,
 
     pub(crate) result: i32,
     pub(crate) manager: SendPtr<Manager>,
     pub(crate) user_arg: SendPtr<[()]>,
-    pub(crate) completion_cb: fn(*mut IO),
+    pub(crate) completion_cb: fn(*mut IO) -> bool,
 }
 
 pub(crate) struct UringLoop {
@@ -243,8 +238,8 @@ impl UringLoop {
                 self.submit_to_disk()?;
                 if let Some(io) = self.receive_from_kernel() {
                     self.nring -= 1;
-                    ((*io).completion_cb)(io);
-                    if !(*io).leak {
+                    let reused = ((*io).completion_cb)(io);
+                    if !(reused || (*io).leak) {
                         self.io_q.dealloc(io.to_send_ptr());
                     }
                 }
@@ -301,7 +296,7 @@ mod tests {
     use std::fs;
     use std::fs::OpenOptions;
     use std::io::Write;
-    use std::sync::atomic::AtomicPtr;
+    use std::sync::atomic::AtomicU8;
     use std::sync::atomic::Ordering;
 
     use rand;
@@ -309,8 +304,6 @@ mod tests {
     use rustix::fd::AsRawFd;
 
     use super::*;
-    use crate::send_ptr::SendPtr;
-    use crate::OpResult;
 
     #[test]
     fn test() {
@@ -332,19 +325,17 @@ mod tests {
 
         let mut manager = Manager::new(&[test_file.as_raw_fd()], 128).unwrap();
         let mut read = vec![0; size];
-        let result = AtomicPtr::from(Box::into_raw(Box::new(OpResult::Pending)));
-        let io = manager.read(&mut read, 0, SendPtr::new(&result as *const _ as *mut _));
+        let result = AtomicU8::from(OP_RESULT_PENDING);
+        let io = manager.read(&mut read, 0, &result);
 
         unsafe {
             (*io.get()).offset = 0;
         }
 
-        manager.push(io.get());
+        manager.push(io);
 
-        unsafe {
-            while *(result.load(Ordering::Acquire)) == OpResult::Pending {
-                spin_loop();
-            }
+        while result.load(Ordering::Acquire) == OP_RESULT_PENDING {
+            spin_loop();
         }
 
         drop(test_file);
