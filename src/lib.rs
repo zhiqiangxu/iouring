@@ -72,8 +72,7 @@ impl Manager {
             (*p_io).fd = fd_idx;
             (*p_io).len = buf.len();
             (*p_io).op_code = OpCode::Read;
-            (*p_io).leak = true;
-            (*p_io).manager = SendPtr::new(self as *const Manager as *mut Manager);
+            (*p_io).leak = false;
             (*p_io).user_arg = SendPtr::new(mem::transmute((
                 (valid as *const _ as *mut AtomicU8).expose_addr(),
                 0,
@@ -111,7 +110,6 @@ impl Manager {
                 (*io).buf = SendPtr::new((*io).buf.get().offset((*io).result as isize));
                 (*io).len -= (*io).result as usize;
                 (*io).offset += (*io).result as usize;
-                (*(*io).manager.get()).push(SendPtr::new(io));
                 return true;
             }
             return false;
@@ -135,7 +133,6 @@ pub struct IO {
     pub(crate) leak: bool,
 
     pub(crate) result: i32,
-    pub(crate) manager: SendPtr<Manager>,
     pub(crate) user_arg: SendPtr<[()]>,
     pub(crate) completion_cb: fn(*mut IO) -> bool,
 }
@@ -238,8 +235,13 @@ impl UringLoop {
                 self.submit_to_disk()?;
                 if let Some(io) = self.receive_from_kernel() {
                     self.nring -= 1;
-                    let reused = ((*io).completion_cb)(io);
-                    if !(reused || (*io).leak) {
+                    let resubmit = ((*io).completion_cb)(io);
+                    if resubmit {
+                        self.io_q
+                            .to_disk_q
+                            .push(io.to_send_ptr())
+                            .expect("this should not block if callee operates correctly");
+                    } else if !(*io).leak {
                         self.io_q.dealloc(io.to_send_ptr());
                     }
                 }
