@@ -15,3 +15,8 @@ rustix = {version = "0.38", features = ["fs", "mm", "io_uring"]}
 [dev-dependencies]
 tempfile = "3.8.1"
 rand = "0.8"
+criterion = "0.3"
+
+[[bench]]
+name = "iouring"
+harness = false

@@ -341,7 +341,6 @@ mod tests {
         }
 
         drop(test_file);
-        fs::remove_file(test_filename).unwrap();
         manager.terminate_and_wait().unwrap();
 
         assert_eq!(read, random_bytes);
