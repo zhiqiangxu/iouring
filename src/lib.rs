@@ -5,13 +5,10 @@
 use std::hint::spin_loop;
 use std::intrinsics::likely;
 use std::io;
-use std::mem;
 use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
-use std::ptr::from_exposed_addr;
 use std::ptr::from_exposed_addr_mut;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -22,6 +19,7 @@ use io_uring::squeue;
 use io_uring::squeue::Flags;
 use io_uring::types;
 use io_uring::IoUring;
+use rustix::io::Errno;
 mod queue;
 mod send_ptr;
 use std::sync::Arc;
@@ -44,7 +42,7 @@ pub const OP_RESULT_OK: u8 = 1u8;
 pub const OP_RESULT_NG: u8 = 2u8;
 
 impl Manager {
-    pub fn new(fds: &[RawFd], queue_size: u32) -> Result<Self> {
+    pub fn new(queue_size: u32, fds: &[RawFd], bufs: &[&[u8]]) -> Result<Self> {
         let terminate = Arc::new(AtomicBool::new(false));
         let uringloop =
             UringLoop::new(terminate.clone(), queue_size).context("create uringloop")?;
@@ -53,6 +51,9 @@ impl Manager {
         uringloop
             .register_files(fds)
             .context("register files to io_uring")?;
+        uringloop
+            .register_buffers(bufs)
+            .context("register buffers for I/O")?;
 
         let uringloop_handle = Some(uringloop.start_loop());
 
@@ -63,63 +64,38 @@ impl Manager {
         })
     }
 
-    pub fn read(&self, buf: &mut [u8], fd_idx: i32, valid: &AtomicU8) -> SendPtr<IO> {
+    #[inline]
+    pub fn submit_read_exact(
+        &self,
+        fd_idx: i32,
+        buf: &mut [u8],
+        offset: usize,
+        completion_cb: Callback,
+    ) {
+        let io = self.io_q.alloc();
+        let p_io = io.get();
         unsafe {
-            let io = self.io_q.alloc();
-
-            let p_io = io.get();
             (*p_io).buf = SendPtr::new(buf.as_mut_ptr());
             (*p_io).fd = fd_idx;
-            (*p_io).len = buf.len();
-            (*p_io).op_code = OpCode::Read;
-            (*p_io).leak = false;
-            (*p_io).user_arg = SendPtr::new(mem::transmute((
-                (valid as *const _ as *mut AtomicU8).expose_addr(),
-                0,
-            )));
-            (*p_io).completion_cb = Self::read_completion_cb;
-            io
+            (*p_io).len = buf.len() as _;
+            (*p_io).offset = offset;
+            (*p_io).op_code = OpCode::ReadExact;
+            (*p_io).completion_cb = completion_cb;
         }
-    }
-
-    pub fn terminate_and_wait(&mut self) -> thread::Result<()> {
-        if let Some(uringloop_handle) = self.uringloop_handle.take() {
-            self.terminate.store(true, Ordering::Release);
-            uringloop_handle.join()
-        } else {
-            Ok(())
-        }
-    }
-
-    pub fn push(&self, io: SendPtr<IO>) {
         self.io_q.push_to_kernel(io);
     }
 
-    // returns a boolean value indicating whether IO is re-used.
-    fn read_completion_cb(io: *mut IO) -> bool {
-        unsafe {
-            let (valid, _): (usize, usize) = mem::transmute((*io).user_arg.get());
-            let valid: *const AtomicU8 = from_exposed_addr(valid);
-
-            if (*io).result <= 0 {
-                // dbg!(&*io);
-                (*valid).swap(OP_RESULT_NG, Ordering::Release);
-            } else if (*io).result as usize == (*io).len {
-                (*valid).swap(OP_RESULT_OK, Ordering::Release);
-            } else {
-                (*io).buf = SendPtr::new((*io).buf.get().offset((*io).result as isize));
-                (*io).len -= (*io).result as usize;
-                (*io).offset += (*io).result as usize;
-                return true;
-            }
-            return false;
+    pub fn terminate_and_wait(&mut self) {
+        if let Some(uringloop_handle) = self.uringloop_handle.take() {
+            self.terminate.store(true, Ordering::Release);
+            uringloop_handle.join().expect("uringloop thread paniced");
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum OpCode {
-    Read,
+    ReadExact,
 }
 
 #[derive(Debug)]
@@ -128,13 +104,32 @@ pub struct IO {
 
     pub(crate) op_code: OpCode,
     pub(crate) fd: i32,
-    pub(crate) len: usize,
-    pub offset: usize,
-    pub(crate) leak: bool,
+    pub(crate) len: u32,
+    pub(crate) offset: usize,
 
     pub(crate) result: i32,
-    pub(crate) user_arg: SendPtr<[()]>,
-    pub(crate) completion_cb: fn(*mut IO) -> bool,
+
+    pub(crate) completion_cb: Callback,
+}
+
+impl IO {
+    pub fn result(&self) -> i32 {
+        self.result
+    }
+    pub fn user_arg1(&self) -> u64 {
+        self.completion_cb.user_arg1
+    }
+
+    pub fn user_arg2(&self) -> u64 {
+        self.completion_cb.user_arg2
+    }
+}
+// Callback contains 2 u64 in order to fit for fat pointer
+#[derive(Debug, Clone, Copy)]
+pub struct Callback {
+    pub user_arg1: u64,
+    pub user_arg2: u64,
+    pub func: fn(&mut IO),
 }
 
 pub(crate) struct UringLoop {
@@ -181,6 +176,20 @@ impl UringLoop {
         self.io_uring.submitter().register_files(fds)
     }
 
+    pub(crate) fn register_buffers(&self, bufs: &[&[u8]]) -> io::Result<()> {
+        if bufs.is_empty() {
+            return Ok(());
+        }
+        let bufs: Vec<_> = bufs
+            .iter()
+            .map(|buf| libc::iovec {
+                iov_base: (*buf).as_ptr() as *mut _,
+                iov_len: (*buf).len(),
+            })
+            .collect();
+        unsafe { self.io_uring.submitter().register_buffers(&bufs) }
+    }
+
     pub(crate) fn start_loop(mut self) -> JoinHandle<()> {
         unsafe {
             thread::spawn(move || {
@@ -202,7 +211,7 @@ impl UringLoop {
                     let io = io.get();
 
                     op = Some(match (*io).op_code {
-                        OpCode::Read => {
+                        OpCode::ReadExact => {
                             opcode::Read::new(types::Fd((*io).fd), (*io).buf.get(), (*io).len as _)
                                 .offset((*io).offset as _)
                                 .build()
@@ -235,15 +244,8 @@ impl UringLoop {
                 self.submit_to_disk()?;
                 if let Some(io) = self.receive_from_kernel() {
                     self.nring -= 1;
-                    let resubmit = ((*io).completion_cb)(io);
-                    if resubmit {
-                        self.io_q
-                            .to_disk_q
-                            .push(io.to_send_ptr())
-                            .expect("this should not block if callee operates correctly");
-                    } else if !(*io).leak {
-                        self.io_q.dealloc(io.to_send_ptr());
-                    }
+                    ((*io).completion_cb.func)(&mut *io);
+                    self.io_q.dealloc(io.to_send_ptr());
                 }
             }
 
@@ -273,6 +275,21 @@ impl UringLoop {
 
         unsafe {
             (*io).result = cqe.result();
+
+            if (*io).result < 0 {
+                let err = Errno::from_raw_os_error((*io).result.abs());
+                if err == Errno::AGAIN || err == Errno::INTR {
+                    self.io_q.push_to_kernel(io.to_send_ptr());
+                    return None;
+                }
+            } else if (*io).result != (*io).len as i32 {
+                // handle short read/write
+                (*io).buf = SendPtr::new((*io).buf.get().offset((*io).result as isize));
+                (*io).len -= (*io).result as u32;
+                (*io).offset += (*io).result as usize;
+                self.io_q.push_to_kernel(io.to_send_ptr());
+                return None;
+            }
         }
         Some(io)
     }
@@ -295,9 +312,9 @@ impl UringLoop {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::fs::OpenOptions;
     use std::io::Write;
+    use std::ptr;
     use std::sync::atomic::AtomicU8;
     use std::sync::atomic::Ordering;
 
@@ -325,23 +342,32 @@ mod tests {
         let random_bytes: Vec<u8> = (0..size).map(|_| rng.gen()).collect();
         test_file.write_all(&random_bytes).unwrap();
 
-        let mut manager = Manager::new(&[test_file.as_raw_fd()], 128).unwrap();
+        let mut manager = Manager::new(128, &[test_file.as_raw_fd()], &[]).unwrap();
         let mut read = vec![0; size];
-        let result = AtomicU8::from(OP_RESULT_PENDING);
-        let io = manager.read(&mut read, 0, &result);
+        let valid = AtomicU8::from(OP_RESULT_PENDING);
+        let callback = Callback {
+            user_arg1: (&valid as *const AtomicU8).expose_addr() as u64,
+            user_arg2: 0,
+            func: |io: &mut IO| unsafe {
+                let valid: *const AtomicU8 = ptr::from_exposed_addr(io.user_arg1() as usize);
+                (*valid).store(
+                    if io.result() > 0 {
+                        OP_RESULT_OK
+                    } else {
+                        OP_RESULT_NG
+                    },
+                    Ordering::Release,
+                );
+            },
+        };
+        manager.submit_read_exact(0, &mut read, 0, callback);
 
-        unsafe {
-            (*io.get()).offset = 0;
-        }
-
-        manager.push(io);
-
-        while result.load(Ordering::Acquire) == OP_RESULT_PENDING {
+        while valid.load(Ordering::Acquire) == OP_RESULT_PENDING {
             spin_loop();
         }
 
         drop(test_file);
-        manager.terminate_and_wait().unwrap();
+        manager.terminate_and_wait();
 
         assert_eq!(read, random_bytes);
     }
